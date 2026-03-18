@@ -255,22 +255,35 @@ class CreditAnalysisAgent(BaseApexAgent):
 
         for ev in extraction_events:
             payload = ev["payload"]
+            # Parse payload if it's a JSON string
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            
             doc_ids.append(payload.get("document_id", "unknown"))
             facts = payload.get("facts") or {}
+            
+            # Parse facts if it's a JSON string
+            if isinstance(facts, str):
+                facts = json.loads(facts)
+            
             for k, v in facts.items():
                 if v is not None and k not in merged_facts:
                     merged_facts[k] = v
             # Collect quality flags
-            if facts.get("extraction_notes"):
+            if isinstance(facts, dict) and facts.get("extraction_notes"):
                 quality_flags.extend(facts["extraction_notes"])
 
         # Also check for quality assessment anomalies
         qa_events = [e for e in pkg_events if e["event_type"] == "QualityAssessmentCompleted"]
         for ev in qa_events:
-            quality_flags.extend(ev["payload"].get("anomalies", []))
+            qa_payload = ev["payload"]
+            if isinstance(qa_payload, str):
+                qa_payload = json.loads(qa_payload)
+            
+            quality_flags.extend(qa_payload.get("anomalies", []))
             quality_flags.extend([
                 f"CRITICAL_MISSING:{f}"
-                for f in ev["payload"].get("critical_missing_fields", [])
+                for f in qa_payload.get("critical_missing_fields", [])
             ])
 
         ms = int((time.time() - t) * 1000)

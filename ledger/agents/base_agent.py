@@ -125,6 +125,53 @@ class BaseApexAgent(ABC):
         await self._append_session({"event_type":"AgentOutputWritten","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
             "events_written":events_written,"output_summary":summary,"written_at":datetime.now().isoformat()}})
+    
+    async def _record_input_validated(self, input_keys: list, duration_ms: int):
+        """Record successful input validation."""
+        await self._append_session({"event_type":"AgentInputValidated","event_version":1,"payload":{
+            "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
+            "input_keys_validated":input_keys,"validation_duration_ms":duration_ms,
+            "validated_at":datetime.now().isoformat()}})
+    
+    async def _record_input_failed(self, input_keys: list, errors: list):
+        """Record failed input validation."""
+        await self._append_session({"event_type":"AgentInputValidationFailed","event_version":1,"payload":{
+            "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
+            "input_keys_attempted":input_keys,"validation_errors":errors,
+            "failed_at":datetime.now().isoformat()}})
+    
+    async def _append_with_retry(self, stream_id: str, events: list, causation_id: str = None, max_retries: int = 3):
+        """Append events to stream with OCC retry logic. Returns list of positions."""
+        for attempt in range(max_retries):
+            try:
+                ver = await self.store.stream_version(stream_id)
+                positions = await self.store.append(
+                    stream_id=stream_id, 
+                    events=events,
+                    expected_version=ver, 
+                    causation_id=causation_id
+                )
+                return positions
+            except Exception as e:
+                if "OptimisticConcurrencyError" in type(e).__name__ and attempt < max_retries - 1:
+                    await asyncio.sleep(0.1 * (2 ** attempt))
+                    continue
+                raise
+    
+    def _parse_json(self, content: str) -> dict:
+        """Parse JSON from LLM response, extracting from markdown code blocks if needed."""
+        import re
+        # Try to extract JSON from markdown code block
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if match:
+            content = match.group(1)
+        else:
+            # Try to find JSON object in the content
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                content = match.group()
+        
+        return json.loads(content)
 
     async def _complete_session(self, result):
         ms = int((time.time()-self._t0)*1000)
