@@ -60,14 +60,22 @@ class LoanApplicationAggregate:
     async def load(cls, store, application_id: str) -> "LoanApplicationAggregate":
         """Load and replay event stream to rebuild aggregate state."""
         agg = cls(application_id=application_id)
-        # TODO: stream_events = await store.load_stream(f"loan-{application_id}")
-        # TODO: for event in stream_events: agg.apply(event)
+        stream_events = await store.load_stream(f"loan-{application_id}")
+        for event in stream_events:
+            agg.apply(event)
         return agg
 
     def apply(self, event: dict) -> None:
-        """Apply one event to update aggregate state. TODO: implement for each event type."""
-        et = event.get("event_type"); p = event.get("payload", {})
+        """Apply one event to update aggregate state. Implements all event type handlers."""
+        import json
+        et = event.get("event_type")
+        payload = event.get("payload", {})
+        # EventStore returns payload as JSON string, parse it
+        p = json.loads(payload) if isinstance(payload, str) else payload
         self.version += 1
+        self.events.append(event)
+        
+        # Loan lifecycle events
         if et == "ApplicationSubmitted":
             self.state = ApplicationState.SUBMITTED
             self.applicant_id = p.get("applicant_id")
@@ -77,7 +85,39 @@ class LoanApplicationAggregate:
             self.state = ApplicationState.DOCUMENTS_PENDING
         elif et == "DocumentUploaded":
             self.state = ApplicationState.DOCUMENTS_UPLOADED
-        # TODO: implement remaining transitions
+        elif et == "DocumentFormatValidated":
+            pass  # No state change, validation metadata only
+        elif et == "ExtractionCompleted":
+            self.state = ApplicationState.DOCUMENTS_PROCESSED
+        elif et == "PackageReadyForAnalysis":
+            pass  # Trigger for next agent, no state change
+        elif et == "CreditAnalysisRequested":
+            self.state = ApplicationState.CREDIT_ANALYSIS_REQUESTED
+        elif et == "CreditAnalysisCompleted":
+            self.state = ApplicationState.CREDIT_ANALYSIS_COMPLETE
+        elif et == "FraudScreeningRequested":
+            self.state = ApplicationState.FRAUD_SCREENING_REQUESTED
+        elif et == "FraudScreeningCompleted":
+            self.state = ApplicationState.FRAUD_SCREENING_COMPLETE
+        elif et == "ComplianceCheckRequested":
+            self.state = ApplicationState.COMPLIANCE_CHECK_REQUESTED
+        elif et == "ComplianceCheckCompleted":
+            self.state = ApplicationState.COMPLIANCE_CHECK_COMPLETE
+        elif et == "ComplianceRuleFailed":
+            if p.get("is_hard_block"):
+                self.state = ApplicationState.DECLINED_COMPLIANCE
+        elif et == "DecisionRequested":
+            self.state = ApplicationState.PENDING_DECISION
+        elif et == "DecisionGenerated":
+            rec = p.get("recommendation")
+            if rec == "REFER":
+                self.state = ApplicationState.PENDING_HUMAN_REVIEW
+        elif et == "ApplicationApproved":
+            self.state = ApplicationState.APPROVED
+        elif et == "ApplicationDeclined":
+            self.state = ApplicationState.DECLINED
+        elif et == "HumanReviewRequested":
+            self.state = ApplicationState.PENDING_HUMAN_REVIEW
 
     def assert_valid_transition(self, target: ApplicationState) -> None:
         allowed = VALID_TRANSITIONS.get(self.state, [])

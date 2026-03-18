@@ -1,0 +1,52 @@
+triage:
+  char_density_threshold: 0.0005
+  image_area_ratio_threshold: 0.5
+  min_chars_per_page: 100
+
+escalation:
+  strategy_a_min_confidence: 0.6
+  strategy_b_min_confidence: 0.5
+  # On strategy failure (e.g. vision API 404, model not found), fall back to next tier: vision → layout → fast_text
+  fallback_on_failure: true
+
+chunking:
+  max_tokens_per_ldu: 512
+  # Five enforced rules (ChunkValidator)
+  table_integrity: true       # Table cell never split from header row
+  figure_cohesion: true      # Figure caption stored as metadata on parent figure chunk
+  list_unity: true           # Numbered list kept as single LDU unless over max_tokens
+  section_inheritance: true  # Section headers as parent_section on child chunks
+  cross_reference_resolution: true  # "see Table X" resolved and stored as chunk relationships
+
+budget_guard:
+  cost_per_image_usd: 0.000025     # ~Gemini Flash 2.0 image input (approximation)
+  cost_per_layout_page_usd: 0.0    # local CPU — no API cost
+  max_cost_per_document_usd: 0.01  # raised: 161pp × $0.000025 = $0.004 vision cost
+  max_cost_total_usd: 1.00
+  warn_threshold_usd: 0.50
+  on_budget_exceeded: use_strategy_b
+
+domain_hint_keywords:
+  financial:
+    - revenue
+    - balance sheet
+    - income statement
+    - fiscal
+    - audit
+    - financial statements
+  legal:
+    - whereas
+    - hereby
+    - agreement
+    - party
+    - clause
+  technical:
+    - implementation
+    - assessment
+    - methodology
+    - findings
+  medical:
+    - patient
+    - diagnosis
+    - clinical
+    - treatment

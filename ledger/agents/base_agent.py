@@ -345,15 +345,330 @@ class DocumentProcessingAgent(BaseApexAgent):
         return g.compile()
 
     async def _node_validate_inputs(self, state):
-        raise NotImplementedError("Implement _node_validate_inputs: verify DocumentUploaded events exist on loan stream")
+        """Verify DocumentUploaded events exist on loan stream."""
+        from datetime import datetime
+        from ledger.schema.events import AgentInputValidated
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        
+        # Find DocumentUploaded events
+        doc_events = [e for e in loan_stream if e["event_type"] == "DocumentUploaded"]
+        if not doc_events:
+            state["errors"].append("No DocumentUploaded events found")
+            return state
+        
+        # Extract document IDs and file paths
+        state["document_ids"] = [e["payload"]["document_id"] for e in doc_events]
+        state["extracted_facts_by_doc"] = {}
+        
+        # Record node execution
+        await self._record_node_execution(
+            node_name="validate_inputs",
+            input_summary={"application_id": app_id, "documents_found": len(doc_events)},
+            output_summary={"document_ids": state["document_ids"]},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        
+        # Append AgentInputValidated to agent stream
+        event = AgentInputValidated(
+            session_id=state["session_id"],
+            agent_type="document_processing",
+            application_id=app_id,
+            input_hash=self._sha(doc_events),
+            validation_passed=True,
+            validation_errors=[],
+            validated_at=datetime.utcnow()
+        )
+        await self._append_event(event)
+        return state
+    
     async def _node_validate_format(self, state):
-        raise NotImplementedError("Implement _node_validate_format: check PDF/XLSX format, append DocumentFormatValidated or Rejected")
+        """Check PDF/XLSX format, append DocumentFormatValidated or Rejected."""
+        from datetime import datetime
+        from pathlib import Path
+        from ledger.schema.events import DocumentFormatValidated, DocumentFormatRejected
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        doc_events = [e for e in loan_stream if e["event_type"] == "DocumentUploaded"]
+        
+        validated_count = 0
+        for doc_event in doc_events:
+            payload = doc_event["payload"]
+            doc_id = payload["document_id"]
+            file_path = Path(payload["file_path"])
+            doc_format = payload["document_format"]
+            
+            # Check file exists and format is valid
+            if not file_path.exists():
+                event = DocumentFormatRejected(
+                    package_id=f"pkg-{app_id}",
+                    document_id=doc_id,
+                    rejection_reason="file_not_found",
+                    error_message=f"File not found: {file_path}",
+                    rejected_at=datetime.utcnow()
+                )
+                await self._append_event(event, stream_id=f"docpkg-{app_id}")
+                continue
+            
+            # Validate format
+            if doc_format not in ["pdf", "xlsx"]:
+                event = DocumentFormatRejected(
+                    package_id=f"pkg-{app_id}",
+                    document_id=doc_id,
+                    rejection_reason="unsupported_format",
+                    error_message=f"Format {doc_format} not supported",
+                    rejected_at=datetime.utcnow()
+                )
+                await self._append_event(event, stream_id=f"docpkg-{app_id}")
+                continue
+            
+            # Format validated
+            event = DocumentFormatValidated(
+                package_id=f"pkg-{app_id}",
+                document_id=doc_id,
+                document_type=payload["document_type"],
+                format_checks_passed=["file_exists", "format_supported"],
+                file_size_bytes=payload["file_size_bytes"],
+                validated_at=datetime.utcnow()
+            )
+            await self._append_event(event, stream_id=f"docpkg-{app_id}")
+            validated_count += 1
+        
+        await self._record_node_execution(
+            node_name="validate_document_format",
+            input_summary={"documents": len(doc_events)},
+            output_summary={"validated": validated_count},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
     async def _node_extract(self, state):
-        raise NotImplementedError("Implement _node_extract: call Week 3 pipeline per document, append ExtractionStarted + ExtractionCompleted")
+        """Call Week 3 refinery pipeline per document, append ExtractionStarted + ExtractionCompleted."""
+        from datetime import datetime
+        from pathlib import Path
+        import time
+        from ledger.schema.events import ExtractionStarted, ExtractionCompleted
+        from ledger.agents.refinery.agents.triage import TriageAgent
+        from ledger.agents.refinery.agents.extractor import ExtractionRouter
+        from ledger.adapters.refinery_adapter import RefineryAdapter
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        doc_events = [e for e in loan_stream if e["event_type"] == "DocumentUploaded"]
+        
+        # Initialize refinery components
+        triage_agent = TriageAgent()
+        extractor = ExtractionRouter()
+        adapter = RefineryAdapter(llm_client=self.client)
+        
+        total_processing_ms = 0
+        
+        for doc_event in doc_events:
+            payload = doc_event["payload"]
+            doc_id = payload["document_id"]
+            file_path = Path(payload["file_path"])
+            doc_type = payload["document_type"]
+            fiscal_year = payload.get("fiscal_year")
+            
+            if not file_path.exists():
+                continue
+            
+            # Append ExtractionStarted
+            start_event = ExtractionStarted(
+                package_id=f"pkg-{app_id}",
+                document_id=doc_id,
+                document_type=doc_type,
+                pipeline_version="refinery-1.0",
+                extraction_model="gemini-2.0-flash",
+                started_at=datetime.utcnow()
+            )
+            await self._append_event(start_event, stream_id=f"docpkg-{app_id}")
+            
+            # Run refinery pipeline
+            t0 = time.time()
+            try:
+                # Stage 1: Triage
+                profile = triage_agent.profile(file_path)
+                
+                # Stage 2: Extraction
+                extracted_doc = extractor.extract(file_path, profile, force_reextract=False)
+                
+                # Stage 3: Convert to FinancialFacts
+                facts = await adapter.extract_financial_facts(extracted_doc, doc_type, fiscal_year)
+                
+                processing_ms = int((time.time() - t0) * 1000)
+                total_processing_ms += processing_ms
+                
+                # Calculate raw text length
+                raw_text_length = sum(len(page.text) for page in extracted_doc.pages)
+                
+                # Append ExtractionCompleted
+                complete_event = ExtractionCompleted(
+                    package_id=f"pkg-{app_id}",
+                    document_id=doc_id,
+                    document_type=doc_type,
+                    facts=facts,
+                    raw_text_length=raw_text_length,
+                    tables_extracted=len(extracted_doc.tables),
+                    processing_ms=processing_ms,
+                    completed_at=datetime.utcnow()
+                )
+                await self._append_event(complete_event, stream_id=f"docpkg-{app_id}")
+                
+                # Store facts for quality assessment
+                state["extracted_facts_by_doc"][doc_id] = facts.model_dump()
+                
+            except Exception as e:
+                from ledger.schema.events import ExtractionFailed
+                fail_event = ExtractionFailed(
+                    package_id=f"pkg-{app_id}",
+                    document_id=doc_id,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    partial_facts=None,
+                    failed_at=datetime.utcnow()
+                )
+                await self._append_event(fail_event, stream_id=f"docpkg-{app_id}")
+                state["errors"].append(f"Extraction failed for {doc_id}: {e}")
+        
+        await self._record_node_execution(
+            node_name="run_week3_extraction",
+            input_summary={"documents": len(doc_events)},
+            output_summary={"extracted": len(state["extracted_facts_by_doc"]), "total_ms": total_processing_ms},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
     async def _node_assess_quality(self, state):
-        raise NotImplementedError("Implement _node_assess_quality: LLM coherence check, append QualityAssessmentCompleted")
+        """LLM coherence check, append QualityAssessmentCompleted."""
+        from datetime import datetime
+        from ledger.schema.events import QualityAssessmentCompleted
+        import json
+        
+        app_id = state["application_id"]
+        facts_by_doc = state.get("extracted_facts_by_doc", {})
+        
+        if not facts_by_doc:
+            state["quality_assessment"] = {"overall_confidence": 0.0, "is_coherent": False}
+            state["has_critical_issues"] = True
+            return state
+        
+        # Build LLM prompt for quality assessment
+        system_prompt = """You are a financial document quality analyst.
+Check extracted facts for internal consistency. Do NOT make credit decisions.
+Return a JSON object with:
+- overall_confidence (0.0-1.0)
+- is_coherent (boolean)
+- anomalies (list of strings)
+- critical_missing_fields (list of strings)
+- reextraction_recommended (boolean)
+- auditor_notes (string)
+
+Check:
+1. Balance sheet equation: Assets = Liabilities + Equity (within 1% tolerance)
+2. EBITDA plausibility (should be positive for profitable companies)
+3. Margin ranges (gross margin 0-100%, net margin -50% to 50%)
+4. Critical fields present: total_revenue, total_assets, net_income"""
+        
+        user_prompt = f"Extracted financial facts:\n{json.dumps(facts_by_doc, indent=2, default=str)}"
+        
+        # Call LLM
+        response_text, tok_in, tok_out, cost = await self._call_llm(system_prompt, user_prompt, max_tokens=512)
+        
+        # Parse response
+        try:
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            assessment = json.loads(response_text.strip())
+        except:
+            assessment = {
+                "overall_confidence": 0.7,
+                "is_coherent": True,
+                "anomalies": [],
+                "critical_missing_fields": [],
+                "reextraction_recommended": False,
+                "auditor_notes": "LLM response parsing failed, using default assessment"
+            }
+        
+        state["quality_assessment"] = assessment
+        state["has_critical_issues"] = not assessment.get("is_coherent", True) or assessment.get("reextraction_recommended", False)
+        
+        # Append QualityAssessmentCompleted for each document
+        for doc_id in facts_by_doc.keys():
+            event = QualityAssessmentCompleted(
+                package_id=f"pkg-{app_id}",
+                document_id=doc_id,
+                overall_confidence=assessment.get("overall_confidence", 0.7),
+                is_coherent=assessment.get("is_coherent", True),
+                anomalies=assessment.get("anomalies", []),
+                critical_missing_fields=assessment.get("critical_missing_fields", []),
+                reextraction_recommended=assessment.get("reextraction_recommended", False),
+                auditor_notes=assessment.get("auditor_notes", ""),
+                assessed_at=datetime.utcnow()
+            )
+            await self._append_event(event, stream_id=f"docpkg-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="assess_quality",
+            input_summary={"documents_assessed": len(facts_by_doc)},
+            output_summary=assessment,
+            llm_tokens_input=tok_in, llm_tokens_output=tok_out, llm_cost_usd=cost
+        )
+        return state
+    
     async def _node_write_output(self, state):
-        raise NotImplementedError("Implement _node_write_output: append PackageReadyForAnalysis, trigger CreditAnalysisRequested")
+        """Append PackageReadyForAnalysis, trigger CreditAnalysisRequested."""
+        from datetime import datetime
+        from ledger.schema.events import PackageReadyForAnalysis, CreditAnalysisRequested, AgentOutputWritten
+        
+        app_id = state["application_id"]
+        assessment = state.get("quality_assessment", {})
+        
+        # Append PackageReadyForAnalysis to docpkg stream
+        package_event = PackageReadyForAnalysis(
+            package_id=f"pkg-{app_id}",
+            application_id=app_id,
+            documents_processed=len(state.get("extracted_facts_by_doc", {})),
+            has_quality_flags=state.get("has_critical_issues", False),
+            quality_flag_count=len(assessment.get("anomalies", [])),
+            ready_at=datetime.utcnow()
+        )
+        await self._append_event(package_event, stream_id=f"docpkg-{app_id}")
+        
+        # Trigger CreditAnalysisRequested on loan stream
+        credit_event = CreditAnalysisRequested(
+            application_id=app_id,
+            requested_at=datetime.utcnow(),
+            requested_by=f"agent-{self.agent_id}",
+            priority="NORMAL"
+        )
+        await self._append_event(credit_event, stream_id=f"loan-{app_id}")
+        
+        # Append AgentOutputWritten
+        output_event = AgentOutputWritten(
+            session_id=state["session_id"],
+            agent_type="document_processing",
+            application_id=app_id,
+            output_events_written=["PackageReadyForAnalysis", "CreditAnalysisRequested"],
+            output_hash=self._sha({"package": package_event.model_dump(), "credit": credit_event.model_dump()}),
+            written_at=datetime.utcnow()
+        )
+        await self._append_event(output_event)
+        
+        state["output_events_written"] = ["PackageReadyForAnalysis", "CreditAnalysisRequested"]
+        state["next_agent_triggered"] = "credit_analysis"
+        
+        await self._record_node_execution(
+            node_name="write_output",
+            input_summary={"documents": len(state.get("extracted_facts_by_doc", {}))},
+            output_summary={"events_written": 2, "next_agent": "credit_analysis"},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
 
 
 class FraudDetectionAgent(BaseApexAgent):
