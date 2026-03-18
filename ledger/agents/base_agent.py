@@ -709,11 +709,329 @@ class FraudDetectionAgent(BaseApexAgent):
         g.add_edge("write_output",END)
         return g.compile()
 
-    async def _node_validate_inputs(self, state): raise NotImplementedError("verify FraudScreeningRequested event exists on loan stream")
-    async def _node_load_document_facts(self, state): raise NotImplementedError("load ExtractionCompleted events from docpkg stream")
-    async def _node_cross_reference_registry(self, state): raise NotImplementedError("query registry: get_company + get_financial_history")
-    async def _node_analyze_fraud_patterns(self, state): raise NotImplementedError("LLM: compare extracted facts vs registry history, compute fraud_score")
-    async def _node_write_output(self, state): raise NotImplementedError("append FraudScreeningCompleted, trigger ComplianceCheckRequested")
+    async def _node_validate_inputs(self, state):
+        """Verify FraudScreeningRequested event exists on loan stream."""
+        from datetime import datetime
+        from ledger.schema.events import AgentInputValidated
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        
+        # Find FraudScreeningRequested event
+        fraud_requested = [e for e in loan_stream if e["event_type"] == "FraudScreeningRequested"]
+        if not fraud_requested:
+            state["errors"].append("No FraudScreeningRequested event found")
+            return state
+        
+        await self._record_node_execution(
+            node_name="validate_inputs",
+            input_summary={"application_id": app_id},
+            output_summary={"fraud_requested": len(fraud_requested)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        
+        event = AgentInputValidated(
+            session_id=state["session_id"],
+            agent_type="fraud_detection",
+            application_id=app_id,
+            inputs_validated=["FraudScreeningRequested"],
+            validation_duration_ms=10,
+            validated_at=datetime.utcnow()
+        )
+        await self._append_event(event)
+        return state
+    
+    async def _node_load_document_facts(self, state):
+        """Load ExtractionCompleted events from docpkg stream."""
+        from datetime import datetime
+        import json
+        from ledger.schema.events import ExtractedFactsConsumed
+        
+        app_id = state["application_id"]
+        docpkg_stream = await self.store.load_stream(f"docpkg-{app_id}")
+        
+        # Find ExtractionCompleted events
+        extraction_events = [e for e in docpkg_stream if e["event_type"] == "ExtractionCompleted"]
+        
+        if not extraction_events:
+            state["errors"].append("No ExtractionCompleted events found")
+            state["extracted_facts"] = {}
+            return state
+        
+        # Aggregate all extracted facts
+        all_facts = {}
+        document_ids = []
+        for event in extraction_events:
+            payload = json.loads(event["payload"]) if isinstance(event["payload"], str) else event["payload"]
+            doc_id = payload.get("document_id")
+            facts = payload.get("facts", {})
+            if doc_id and facts:
+                all_facts[doc_id] = facts
+                document_ids.append(doc_id)
+        
+        state["extracted_facts"] = all_facts
+        
+        # Append ExtractedFactsConsumed to credit stream
+        event = ExtractedFactsConsumed(
+            application_id=app_id,
+            session_id=state["session_id"],
+            document_ids_consumed=document_ids,
+            facts_summary=f"{len(all_facts)} documents with financial facts",
+            quality_flags_present=False,
+            consumed_at=datetime.utcnow()
+        )
+        await self._append_event(event, stream_id=f"credit-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="load_document_facts",
+            input_summary={"docpkg_stream": f"docpkg-{app_id}"},
+            output_summary={"documents_loaded": len(all_facts)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_cross_reference_registry(self, state):
+        """Query registry: get_company + get_financial_history."""
+        from datetime import datetime
+        from ledger.schema.events import HistoricalProfileConsumed
+        import json
+        
+        app_id = state["application_id"]
+        
+        # Get applicant_id from loan stream
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        app_submitted = [e for e in loan_stream if e["event_type"] == "ApplicationSubmitted"]
+        if not app_submitted:
+            state["errors"].append("No ApplicationSubmitted event found")
+            return state
+        
+        payload = json.loads(app_submitted[0]["payload"]) if isinstance(app_submitted[0]["payload"], str) else app_submitted[0]["payload"]
+        applicant_id = payload.get("applicant_id")
+        
+        # Query registry
+        company_profile = await self.registry.get_company(applicant_id)
+        financial_history = await self.registry.get_financial_history(applicant_id)
+        
+        state["company_profile"] = company_profile
+        state["historical_financials"] = financial_history
+        
+        # Append HistoricalProfileConsumed to credit stream
+        fiscal_years = [fh["fiscal_year"] for fh in financial_history] if financial_history else []
+        event = HistoricalProfileConsumed(
+            application_id=app_id,
+            session_id=state["session_id"],
+            fiscal_years_loaded=fiscal_years,
+            has_prior_loans=company_profile.get("has_prior_loans", False) if company_profile else False,
+            has_defaults=False,
+            revenue_trajectory=company_profile.get("revenue_trajectory", "UNKNOWN") if company_profile else "UNKNOWN",
+            data_hash=self._sha({"company": company_profile, "history": financial_history}),
+            consumed_at=datetime.utcnow()
+        )
+        await self._append_event(event, stream_id=f"credit-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="cross_reference_registry",
+            input_summary={"applicant_id": applicant_id},
+            output_summary={"fiscal_years": len(fiscal_years), "has_profile": company_profile is not None},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_analyze_fraud_patterns(self, state):
+        """LLM: compare extracted facts vs registry history, compute fraud_score."""
+        from datetime import datetime
+        from ledger.schema.events import FraudScreeningInitiated, FraudAnomalyDetected
+        from decimal import Decimal
+        import json
+        
+        app_id = state["application_id"]
+        extracted_facts = state.get("extracted_facts", {})
+        historical_financials = state.get("historical_financials", [])
+        company_profile = state.get("company_profile", {})
+        
+        # Append FraudScreeningInitiated
+        init_event = FraudScreeningInitiated(
+            application_id=app_id,
+            session_id=state["session_id"],
+            screening_model_version=self.model,
+            initiated_at=datetime.utcnow()
+        )
+        await self._append_event(init_event, stream_id=f"fraud-{app_id}")
+        
+        # Build LLM prompt for fraud analysis
+        system_prompt = """You are a financial fraud detection analyst.
+Compare the submitted financial documents against historical registry data.
+Detect anomalies such as:
+1. Revenue discrepancy > 50% year-over-year without explanation
+2. Balance sheet inconsistencies (Assets != Liabilities + Equity)
+3. Unusual submission patterns or data manipulation
+
+Return a JSON object with:
+- fraud_score (0.0-1.0, where >0.3 indicates high risk)
+- risk_level ("LOW", "MEDIUM", "HIGH")
+- anomalies (list of objects with: anomaly_type, description, severity, evidence, affected_fields)
+- recommendation ("APPROVE_SCREENING", "FLAG_FOR_REVIEW", "REJECT")
+
+RULE: If fraud_score > 0.3, you MUST include at least one named anomaly with evidence."""
+        
+        user_prompt = f"""Submitted financial facts:
+{json.dumps(extracted_facts, indent=2, default=str)}
+
+Historical financials from registry:
+{json.dumps(historical_financials[:3], indent=2, default=str) if historical_financials else 'No historical data available'}
+
+Company profile:
+{json.dumps(company_profile, indent=2, default=str)}"""
+        
+        # Call LLM
+        response_text, tok_in, tok_out, cost = await self._call_llm(system_prompt, user_prompt, max_tokens=1024)
+        
+        # Parse response
+        try:
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            assessment = json.loads(response_text.strip())
+        except:
+            # Fallback: simple rule-based fraud detection
+            assessment = self._rule_based_fraud_detection(extracted_facts, historical_financials)
+        
+        state["fraud_assessment"] = assessment
+        
+        # Append FraudAnomalyDetected for each anomaly
+        anomalies = assessment.get("anomalies", [])
+        for anomaly_data in anomalies:
+            from ledger.schema.events import FraudAnomaly
+            anomaly = FraudAnomaly(
+                anomaly_type=anomaly_data.get("anomaly_type", "REVENUE_DISCREPANCY"),
+                description=anomaly_data.get("description", ""),
+                severity=anomaly_data.get("severity", "MEDIUM"),
+                evidence=anomaly_data.get("evidence", ""),
+                affected_fields=anomaly_data.get("affected_fields", [])
+            )
+            event = FraudAnomalyDetected(
+                application_id=app_id,
+                session_id=state["session_id"],
+                anomaly=anomaly,
+                detected_at=datetime.utcnow()
+            )
+            await self._append_event(event, stream_id=f"fraud-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="analyze_fraud_patterns",
+            input_summary={"documents": len(extracted_facts), "history_years": len(historical_financials)},
+            output_summary={"fraud_score": assessment.get("fraud_score", 0.0), "anomalies": len(anomalies)},
+            llm_tokens_input=tok_in, llm_tokens_output=tok_out, llm_cost_usd=cost
+        )
+        return state
+    
+    def _rule_based_fraud_detection(self, extracted_facts, historical_financials):
+        """Fallback rule-based fraud detection if LLM fails."""
+        from decimal import Decimal
+        
+        fraud_score = 0.0
+        anomalies = []
+        
+        # Check for revenue discrepancy
+        if extracted_facts and historical_financials:
+            for doc_id, facts in extracted_facts.items():
+                current_revenue = facts.get("total_revenue")
+                if current_revenue and historical_financials:
+                    # Compare to most recent historical year
+                    last_year = historical_financials[0]
+                    historical_revenue = last_year.get("total_revenue")
+                    if historical_revenue:
+                        try:
+                            curr = float(current_revenue)
+                            hist = float(historical_revenue)
+                            if hist > 0:
+                                change_pct = abs((curr - hist) / hist)
+                                if change_pct > 0.5:  # >50% change
+                                    fraud_score += 0.4
+                                    anomalies.append({
+                                        "anomaly_type": "REVENUE_DISCREPANCY",
+                                        "description": f"Revenue changed by {change_pct*100:.1f}% year-over-year",
+                                        "severity": "HIGH",
+                                        "evidence": f"Current: {curr}, Historical: {hist}",
+                                        "affected_fields": ["total_revenue"]
+                                    })
+                        except:
+                            pass
+        
+        # Determine risk level
+        if fraud_score > 0.5:
+            risk_level = "HIGH"
+            recommendation = "REJECT"
+        elif fraud_score > 0.3:
+            risk_level = "MEDIUM"
+            recommendation = "FLAG_FOR_REVIEW"
+        else:
+            risk_level = "LOW"
+            recommendation = "APPROVE_SCREENING"
+        
+        return {
+            "fraud_score": min(fraud_score, 1.0),
+            "risk_level": risk_level,
+            "anomalies": anomalies,
+            "recommendation": recommendation
+        }
+    
+    async def _node_write_output(self, state):
+        """Append FraudScreeningCompleted, trigger ComplianceCheckRequested."""
+        from datetime import datetime
+        from ledger.schema.events import FraudScreeningCompleted, ComplianceCheckRequested, AgentOutputWritten
+        
+        app_id = state["application_id"]
+        assessment = state.get("fraud_assessment", {})
+        
+        # Append FraudScreeningCompleted to fraud stream
+        fraud_event = FraudScreeningCompleted(
+            application_id=app_id,
+            session_id=state["session_id"],
+            fraud_score=assessment.get("fraud_score", 0.0),
+            risk_level=assessment.get("risk_level", "LOW"),
+            anomalies_found=len(assessment.get("anomalies", [])),
+            recommendation=assessment.get("recommendation", "APPROVE_SCREENING"),
+            screening_model_version=self.model,
+            input_data_hash=self._sha(state.get("extracted_facts", {})),
+            completed_at=datetime.utcnow()
+        )
+        await self._append_event(fraud_event, stream_id=f"fraud-{app_id}")
+        
+        # Trigger ComplianceCheckRequested on loan stream
+        import os
+        regulation_version = os.getenv("REGULATION_VERSION", "APEX-2024-Q4")
+        compliance_event = ComplianceCheckRequested(
+            application_id=app_id,
+            requested_at=datetime.utcnow(),
+            triggered_by_event_id=str(fraud_event.event_id),
+            regulation_set_version=regulation_version,
+            rules_to_evaluate=["REG-001", "REG-002", "REG-003", "REG-004", "REG-005", "REG-006"]
+        )
+        await self._append_event(compliance_event, stream_id=f"loan-{app_id}")
+        
+        # Append AgentOutputWritten
+        output_event = AgentOutputWritten(
+            session_id=state["session_id"],
+            agent_type="fraud_detection",
+            application_id=app_id,
+            events_written=[{"type": "FraudScreeningCompleted"}, {"type": "ComplianceCheckRequested"}],
+            output_summary=f"Fraud score: {assessment.get('fraud_score', 0.0)}, Risk: {assessment.get('risk_level', 'LOW')}",
+            written_at=datetime.utcnow()
+        )
+        await self._append_event(output_event)
+        
+        state["output_events_written"] = ["FraudScreeningCompleted", "ComplianceCheckRequested"]
+        state["next_agent_triggered"] = "compliance"
+        
+        await self._record_node_execution(
+            node_name="write_output",
+            input_summary={"fraud_score": assessment.get("fraud_score", 0.0)},
+            output_summary={"events_written": 2, "next_agent": "compliance"},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
 
 
 class ComplianceAgent(BaseApexAgent):
@@ -762,14 +1080,428 @@ class ComplianceAgent(BaseApexAgent):
         g.add_edge("write_output",END)
         return g.compile()
 
-    async def _node_validate_inputs(self, state): raise NotImplementedError("load company profile from registry, verify ComplianceCheckRequested event")
-    async def _node_check_reg001(self, state): raise NotImplementedError("BSA: check AML_WATCH flags, append ComplianceRulePassed/Failed")
-    async def _node_check_reg002(self, state): raise NotImplementedError("OFAC: check SANCTIONS_REVIEW flags, hard_block=True if failed")
-    async def _node_check_reg003(self, state): raise NotImplementedError("Jurisdiction: jurisdiction != 'MT', hard_block=True if failed")
-    async def _node_check_reg004(self, state): raise NotImplementedError("Legal type: Sole Proprietor + >250K → failed, remediation_available=True")
-    async def _node_check_reg005(self, state): raise NotImplementedError("Operating history: founded_year <= 2022, hard_block=True if failed")
-    async def _node_check_reg006(self, state): raise NotImplementedError("CRA: always passes, append ComplianceRuleNoted")
-    async def _node_write_output(self, state): raise NotImplementedError("append ComplianceCheckCompleted, then DecisionRequested or ApplicationDeclined")
+    async def _node_validate_inputs(self, state):
+        """Load company profile from registry, verify ComplianceCheckRequested event."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceCheckInitiated, AgentInputValidated
+        import json
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        
+        # Find ComplianceCheckRequested event
+        compliance_requested = [e for e in loan_stream if e["event_type"] == "ComplianceCheckRequested"]
+        if not compliance_requested:
+            state["errors"].append("No ComplianceCheckRequested event found")
+            return state
+        
+        # Get applicant_id and regulation version
+        app_submitted = [e for e in loan_stream if e["event_type"] == "ApplicationSubmitted"]
+        if not app_submitted:
+            state["errors"].append("No ApplicationSubmitted event found")
+            return state
+        
+        payload = json.loads(app_submitted[0]["payload"]) if isinstance(app_submitted[0]["payload"], str) else app_submitted[0]["payload"]
+        applicant_id = payload.get("applicant_id")
+        
+        compliance_payload = json.loads(compliance_requested[0]["payload"]) if isinstance(compliance_requested[0]["payload"], str) else compliance_requested[0]["payload"]
+        regulation_version = compliance_payload.get("regulation_set_version", "APEX-2024-Q4")
+        rules_to_evaluate = compliance_payload.get("rules_to_evaluate", [])
+        
+        # Load company profile from registry
+        company_profile = await self.registry.get_company(applicant_id)
+        state["company_profile"] = company_profile
+        state["rules_results"] = []
+        state["hard_block"] = False
+        
+        # Append ComplianceCheckInitiated
+        init_event = ComplianceCheckInitiated(
+            application_id=app_id,
+            session_id=state["session_id"],
+            regulation_set_version=regulation_version,
+            rules_to_evaluate=rules_to_evaluate,
+            initiated_at=datetime.utcnow()
+        )
+        await self._append_event(init_event, stream_id=f"compliance-{app_id}")
+        
+        # Append AgentInputValidated
+        event = AgentInputValidated(
+            session_id=state["session_id"],
+            agent_type="compliance",
+            application_id=app_id,
+            inputs_validated=["ComplianceCheckRequested", "company_profile"],
+            validation_duration_ms=15,
+            validated_at=datetime.utcnow()
+        )
+        await self._append_event(event)
+        
+        await self._record_node_execution(
+            node_name="validate_inputs",
+            input_summary={"application_id": app_id, "regulation_version": regulation_version},
+            output_summary={"rules_to_check": len(rules_to_evaluate)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg001(self, state):
+        """REG-001: BSA - Check AML_WATCH flags."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRulePassed, ComplianceRuleFailed
+        
+        app_id = state["application_id"]
+        company_profile = state.get("company_profile", {})
+        
+        # Query compliance flags
+        applicant_id = company_profile.get("company_id")
+        compliance_flags = await self.registry.get_compliance_flags(applicant_id) if applicant_id else []
+        
+        # Check for active AML_WATCH flags
+        aml_flags = [f for f in compliance_flags if f.get("flag_type") == "AML_WATCH" and f.get("is_active")]
+        
+        if aml_flags:
+            # Rule failed
+            event = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-001",
+                rule_name="BSA Anti-Money Laundering Check",
+                failure_reason=f"Active AML_WATCH flags found: {len(aml_flags)}",
+                is_hard_block=False,
+                remediation_available=True,
+                remediation_steps=["Submit AML clearance documentation", "Provide source of funds verification"],
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-001", "passed": False, "hard_block": False})
+        else:
+            # Rule passed
+            event = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-001",
+                rule_name="BSA Anti-Money Laundering Check",
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-001", "passed": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg001",
+            input_summary={"aml_flags_checked": len(compliance_flags)},
+            output_summary={"passed": len(aml_flags) == 0, "active_flags": len(aml_flags)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg002(self, state):
+        """REG-002: OFAC - Check SANCTIONS_REVIEW flags (HARD BLOCK)."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRulePassed, ComplianceRuleFailed
+        
+        app_id = state["application_id"]
+        company_profile = state.get("company_profile", {})
+        
+        # Query compliance flags
+        applicant_id = company_profile.get("company_id")
+        compliance_flags = await self.registry.get_compliance_flags(applicant_id) if applicant_id else []
+        
+        # Check for active SANCTIONS_REVIEW flags
+        sanctions_flags = [f for f in compliance_flags if f.get("flag_type") == "SANCTIONS_REVIEW" and f.get("is_active")]
+        
+        if sanctions_flags:
+            # Rule failed - HARD BLOCK
+            event = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-002",
+                rule_name="OFAC Sanctions Screening",
+                failure_reason=f"Active SANCTIONS_REVIEW flags found: {len(sanctions_flags)}",
+                is_hard_block=True,
+                remediation_available=False,
+                remediation_steps=[],
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-002", "passed": False, "hard_block": True})
+            state["hard_block"] = True
+        else:
+            # Rule passed
+            event = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-002",
+                rule_name="OFAC Sanctions Screening",
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-002", "passed": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg002",
+            input_summary={"sanctions_flags_checked": len(compliance_flags)},
+            output_summary={"passed": len(sanctions_flags) == 0, "hard_block": state["hard_block"]},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg003(self, state):
+        """REG-003: Jurisdiction - Must not be Montana (HARD BLOCK)."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRulePassed, ComplianceRuleFailed
+        
+        app_id = state["application_id"]
+        company_profile = state.get("company_profile", {})
+        
+        jurisdiction = company_profile.get("jurisdiction", "")
+        
+        if jurisdiction == "MT":
+            # Rule failed - HARD BLOCK
+            event = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-003",
+                rule_name="Prohibited Jurisdiction Check",
+                failure_reason=f"Applicant jurisdiction '{jurisdiction}' is prohibited (Montana restriction)",
+                is_hard_block=True,
+                remediation_available=False,
+                remediation_steps=[],
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-003", "passed": False, "hard_block": True})
+            state["hard_block"] = True
+        else:
+            # Rule passed
+            event = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-003",
+                rule_name="Prohibited Jurisdiction Check",
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-003", "passed": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg003",
+            input_summary={"jurisdiction": jurisdiction},
+            output_summary={"passed": jurisdiction != "MT", "hard_block": state["hard_block"]},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg004(self, state):
+        """REG-004: Legal Type - Sole Proprietor with >$250K is restricted."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRulePassed, ComplianceRuleFailed
+        import json
+        
+        app_id = state["application_id"]
+        company_profile = state.get("company_profile", {})
+        
+        # Get requested amount from loan stream
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        app_submitted = [e for e in loan_stream if e["event_type"] == "ApplicationSubmitted"]
+        payload = json.loads(app_submitted[0]["payload"]) if isinstance(app_submitted[0]["payload"], str) else app_submitted[0]["payload"]
+        requested_amount = float(payload.get("requested_amount_usd", 0))
+        
+        legal_type = company_profile.get("legal_type", "")
+        
+        if legal_type == "Sole Proprietor" and requested_amount > 250000:
+            # Rule failed - remediation available
+            event = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-004",
+                rule_name="Legal Entity Structure Requirement",
+                failure_reason=f"Sole Proprietor requesting ${requested_amount:,.0f} exceeds $250K limit",
+                is_hard_block=False,
+                remediation_available=True,
+                remediation_steps=["Convert to LLC or Corporation", "Reduce loan amount to $250,000 or less"],
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-004", "passed": False, "hard_block": False})
+        else:
+            # Rule passed
+            event = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-004",
+                rule_name="Legal Entity Structure Requirement",
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-004", "passed": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg004",
+            input_summary={"legal_type": legal_type, "requested_amount": requested_amount},
+            output_summary={"passed": not (legal_type == "Sole Proprietor" and requested_amount > 250000)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg005(self, state):
+        """REG-005: Operating History - Must be founded by 2022 or earlier (HARD BLOCK)."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRulePassed, ComplianceRuleFailed
+        
+        app_id = state["application_id"]
+        company_profile = state.get("company_profile", {})
+        
+        founded_year = company_profile.get("founded_year")
+        
+        if founded_year is None or founded_year > 2022:
+            # Rule failed - HARD BLOCK
+            event = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-005",
+                rule_name="Minimum Operating History Requirement",
+                failure_reason=f"Company founded in {founded_year or 'unknown year'}, requires 2+ years operating history (founded ≤ 2022)",
+                is_hard_block=True,
+                remediation_available=False,
+                remediation_steps=[],
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-005", "passed": False, "hard_block": True})
+            state["hard_block"] = True
+        else:
+            # Rule passed
+            event = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=state["session_id"],
+                rule_id="REG-005",
+                rule_name="Minimum Operating History Requirement",
+                evaluated_at=datetime.utcnow()
+            )
+            state["rules_results"].append({"rule_id": "REG-005", "passed": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg005",
+            input_summary={"founded_year": founded_year},
+            output_summary={"passed": founded_year is not None and founded_year <= 2022, "hard_block": state["hard_block"]},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_check_reg006(self, state):
+        """REG-006: CRA Consideration - Always passes, informational note."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceRuleNoted
+        
+        app_id = state["application_id"]
+        
+        # Always passes - just a note
+        event = ComplianceRuleNoted(
+            application_id=app_id,
+            session_id=state["session_id"],
+            rule_id="REG-006",
+            rule_name="Community Reinvestment Act Consideration",
+            note_type="CRA_CONSIDERATION",
+            note_text="Application eligible for CRA credit consideration",
+            evaluated_at=datetime.utcnow()
+        )
+        state["rules_results"].append({"rule_id": "REG-006", "passed": True, "noted": True})
+        
+        await self._append_event(event, stream_id=f"compliance-{app_id}")
+        
+        await self._record_node_execution(
+            node_name="check_reg006",
+            input_summary={"rule_type": "informational"},
+            output_summary={"noted": True},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_write_output(self, state):
+        """Append ComplianceCheckCompleted, then DecisionRequested or ApplicationDeclined."""
+        from datetime import datetime
+        from ledger.schema.events import ComplianceCheckCompleted, DecisionRequested, ApplicationDeclined, AgentOutputWritten
+        
+        app_id = state["application_id"]
+        rules_results = state.get("rules_results", [])
+        hard_block = state.get("hard_block", False)
+        
+        # Calculate summary
+        rules_evaluated = len(rules_results)
+        rules_passed = len([r for r in rules_results if r.get("passed")])
+        rules_failed = len([r for r in rules_results if not r.get("passed") and not r.get("noted")])
+        rules_noted = len([r for r in rules_results if r.get("noted")])
+        
+        # Determine overall verdict
+        if hard_block:
+            overall_verdict = "BLOCKED"
+        elif rules_failed > 0:
+            overall_verdict = "CONDITIONAL"
+        else:
+            overall_verdict = "CLEAR"
+        
+        state["overall_verdict"] = overall_verdict
+        
+        # Append ComplianceCheckCompleted
+        compliance_event = ComplianceCheckCompleted(
+            application_id=app_id,
+            session_id=state["session_id"],
+            rules_evaluated=rules_evaluated,
+            rules_passed=rules_passed,
+            rules_failed=rules_failed,
+            rules_noted=rules_noted,
+            has_hard_block=hard_block,
+            overall_verdict=overall_verdict,
+            completed_at=datetime.utcnow()
+        )
+        await self._append_event(compliance_event, stream_id=f"compliance-{app_id}")
+        
+        # If hard block, decline application immediately
+        if hard_block:
+            failed_rules = [r for r in rules_results if not r.get("passed") and r.get("hard_block")]
+            decline_reasons = [f"Failed {r['rule_id']}: hard block" for r in failed_rules]
+            
+            decline_event = ApplicationDeclined(
+                application_id=app_id,
+                decline_reasons=decline_reasons,
+                declined_by=f"agent-{self.agent_id}",
+                adverse_action_notice_required=True,
+                adverse_action_codes=[r["rule_id"] for r in failed_rules],
+                declined_at=datetime.utcnow()
+            )
+            await self._append_event(decline_event, stream_id=f"loan-{app_id}")
+            state["output_events_written"] = ["ComplianceCheckCompleted", "ApplicationDeclined"]
+            state["next_agent_triggered"] = None
+        else:
+            # Trigger DecisionRequested
+            decision_event = DecisionRequested(
+                application_id=app_id,
+                requested_at=datetime.utcnow(),
+                all_analyses_complete=True,
+                triggered_by_event_id=str(compliance_event.event_id)
+            )
+            await self._append_event(decision_event, stream_id=f"loan-{app_id}")
+            state["output_events_written"] = ["ComplianceCheckCompleted", "DecisionRequested"]
+            state["next_agent_triggered"] = "decision_orchestrator"
+        
+        # Append AgentOutputWritten
+        output_event = AgentOutputWritten(
+            session_id=state["session_id"],
+            agent_type="compliance",
+            application_id=app_id,
+            events_written=[{"type": e} for e in state["output_events_written"]],
+            output_summary=f"Verdict: {overall_verdict}, Hard block: {hard_block}",
+            written_at=datetime.utcnow()
+        )
+        await self._append_event(output_event)
+        
+        await self._record_node_execution(
+            node_name="write_output",
+            input_summary={"rules_evaluated": rules_evaluated, "hard_block": hard_block},
+            output_summary={"verdict": overall_verdict, "events_written": len(state["output_events_written"])},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
 
 
 class DecisionOrchestratorAgent(BaseApexAgent):
@@ -819,8 +1551,318 @@ class DecisionOrchestratorAgent(BaseApexAgent):
         g.add_edge("write_output",END)
         return g.compile()
 
-    async def _node_validate_inputs(self, state): raise NotImplementedError("verify DecisionRequested event, all 3 analysis streams complete")
-    async def _node_load_all_analyses(self, state): raise NotImplementedError("load credit, fraud, compliance streams; extract latest completed events")
-    async def _node_synthesize_decision(self, state): raise NotImplementedError("LLM: synthesize all 3 inputs into recommendation + executive_summary")
-    async def _node_apply_hard_constraints(self, state): raise NotImplementedError("Python rules: compliance BLOCKED→DECLINE, confidence<0.6→REFER, fraud>0.6→REFER")
-    async def _node_write_output(self, state): raise NotImplementedError("append DecisionGenerated + ApplicationApproved/Declined/HumanReviewRequested")
+    async def _node_validate_inputs(self, state):
+        """Verify DecisionRequested event, all 3 analysis streams complete."""
+        from datetime import datetime
+        from ledger.schema.events import AgentInputValidated
+        
+        app_id = state["application_id"]
+        loan_stream = await self.store.load_stream(f"loan-{app_id}")
+        
+        # Find DecisionRequested event
+        decision_requested = [e for e in loan_stream if e["event_type"] == "DecisionRequested"]
+        if not decision_requested:
+            state["errors"].append("No DecisionRequested event found")
+            return state
+        
+        await self._record_node_execution(
+            node_name="validate_inputs",
+            input_summary={"application_id": app_id},
+            output_summary={"decision_requested": len(decision_requested)},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        
+        event = AgentInputValidated(
+            session_id=state["session_id"],
+            agent_type="decision_orchestrator",
+            application_id=app_id,
+            inputs_validated=["DecisionRequested"],
+            validation_duration_ms=10,
+            validated_at=datetime.utcnow()
+        )
+        await self._append_event(event)
+        return state
+    
+    async def _node_load_all_analyses(self, state):
+        """Load credit, fraud, compliance streams; extract latest completed events."""
+        import json
+        
+        app_id = state["application_id"]
+        
+        # Load credit analysis
+        try:
+            credit_stream = await self.store.load_stream(f"credit-{app_id}")
+            credit_completed = [e for e in credit_stream if e["event_type"] == "CreditAnalysisCompleted"]
+            if credit_completed:
+                payload = json.loads(credit_completed[-1]["payload"]) if isinstance(credit_completed[-1]["payload"], str) else credit_completed[-1]["payload"]
+                state["credit_analysis"] = payload
+            else:
+                state["credit_analysis"] = None
+        except:
+            state["credit_analysis"] = None
+        
+        # Load fraud screening
+        try:
+            fraud_stream = await self.store.load_stream(f"fraud-{app_id}")
+            fraud_completed = [e for e in fraud_stream if e["event_type"] == "FraudScreeningCompleted"]
+            if fraud_completed:
+                payload = json.loads(fraud_completed[-1]["payload"]) if isinstance(fraud_completed[-1]["payload"], str) else fraud_completed[-1]["payload"]
+                state["fraud_screening"] = payload
+            else:
+                state["fraud_screening"] = None
+        except:
+            state["fraud_screening"] = None
+        
+        # Load compliance check
+        try:
+            compliance_stream = await self.store.load_stream(f"compliance-{app_id}")
+            compliance_completed = [e for e in compliance_stream if e["event_type"] == "ComplianceCheckCompleted"]
+            if compliance_completed:
+                payload = json.loads(compliance_completed[-1]["payload"]) if isinstance(compliance_completed[-1]["payload"], str) else compliance_completed[-1]["payload"]
+                state["compliance_record"] = payload
+            else:
+                state["compliance_record"] = None
+        except:
+            state["compliance_record"] = None
+        
+        await self._record_node_execution(
+            node_name="load_all_analyses",
+            input_summary={"application_id": app_id},
+            output_summary={
+                "has_credit": state["credit_analysis"] is not None,
+                "has_fraud": state["fraud_screening"] is not None,
+                "has_compliance": state["compliance_record"] is not None
+            },
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_synthesize_decision(self, state):
+        """LLM: synthesize all 3 inputs into recommendation + executive_summary."""
+        import json
+        
+        app_id = state["application_id"]
+        credit = state.get("credit_analysis", {})
+        fraud = state.get("fraud_screening", {})
+        compliance = state.get("compliance_record", {})
+        
+        # Build LLM prompt for decision synthesis
+        system_prompt = """You are a senior loan underwriting officer synthesizing multiple analyses into a final decision.
+
+Your task:
+1. Review credit analysis, fraud screening, and compliance results
+2. Produce an executive summary (2-3 sentences)
+3. List key risks (3-5 bullet points)
+4. Make an initial recommendation: APPROVE, DECLINE, or REFER
+
+Return a JSON object with:
+- recommendation ("APPROVE", "DECLINE", "REFER")
+- confidence (0.0-1.0)
+- approved_amount_usd (number, if APPROVE)
+- conditions (list of strings, if APPROVE)
+- executive_summary (string)
+- key_risks (list of strings)
+
+Guidelines:
+- APPROVE: Strong credit, low fraud risk, compliance clear
+- DECLINE: High risk, poor credit, or significant fraud indicators
+- REFER: Borderline cases, missing data, or moderate concerns requiring human review"""
+        
+        user_prompt = f"""Credit Analysis:
+{json.dumps(credit, indent=2, default=str) if credit else 'Not available'}
+
+Fraud Screening:
+{json.dumps(fraud, indent=2, default=str) if fraud else 'Not available'}
+
+Compliance Check:
+{json.dumps(compliance, indent=2, default=str) if compliance else 'Not available'}"""
+        
+        # Call LLM
+        response_text, tok_in, tok_out, cost = await self._call_llm(system_prompt, user_prompt, max_tokens=1024)
+        
+        # Parse response
+        try:
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            decision = json.loads(response_text.strip())
+        except:
+            # Fallback: conservative decision
+            decision = {
+                "recommendation": "REFER",
+                "confidence": 0.5,
+                "approved_amount_usd": None,
+                "conditions": [],
+                "executive_summary": "Unable to synthesize decision from LLM response. Referring for human review.",
+                "key_risks": ["LLM synthesis failed"]
+            }
+        
+        state["orchestrator_decision"] = decision
+        
+        await self._record_node_execution(
+            node_name="synthesize_decision",
+            input_summary={"analyses_loaded": 3},
+            output_summary={"recommendation": decision.get("recommendation"), "confidence": decision.get("confidence")},
+            llm_tokens_input=tok_in, llm_tokens_output=tok_out, llm_cost_usd=cost
+        )
+        return state
+    
+    async def _node_apply_hard_constraints(self, state):
+        """Apply hard constraints: compliance BLOCKED → DECLINE, low confidence → REFER, etc."""
+        decision = state.get("orchestrator_decision", {})
+        compliance = state.get("compliance_record", {})
+        fraud = state.get("fraud_screening", {})
+        credit = state.get("credit_analysis", {})
+        
+        original_recommendation = decision.get("recommendation", "REFER")
+        
+        # Hard constraint 1: Compliance BLOCKED → must DECLINE
+        if compliance.get("overall_verdict") == "BLOCKED":
+            decision["recommendation"] = "DECLINE"
+            decision["key_risks"] = decision.get("key_risks", []) + ["Compliance hard block"]
+        
+        # Hard constraint 2: Confidence < 0.60 → must REFER
+        elif decision.get("confidence", 0.0) < 0.60:
+            decision["recommendation"] = "REFER"
+            decision["key_risks"] = decision.get("key_risks", []) + ["Low confidence score"]
+        
+        # Hard constraint 3: Fraud score > 0.60 → must REFER
+        elif fraud.get("fraud_score", 0.0) > 0.60:
+            decision["recommendation"] = "REFER"
+            decision["key_risks"] = decision.get("key_risks", []) + ["High fraud risk"]
+        
+        # Hard constraint 4: Risk tier HIGH AND confidence >= 0.70 → DECLINE eligible
+        elif credit.get("decision", {}).get("risk_tier") == "HIGH" and decision.get("confidence", 0.0) >= 0.70:
+            if original_recommendation != "APPROVE":
+                decision["recommendation"] = "DECLINE"
+                decision["key_risks"] = decision.get("key_risks", []) + ["High credit risk tier"]
+        
+        state["orchestrator_decision"] = decision
+        
+        await self._record_node_execution(
+            node_name="apply_hard_constraints",
+            input_summary={"original_recommendation": original_recommendation},
+            output_summary={"final_recommendation": decision.get("recommendation")},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
+    
+    async def _node_write_output(self, state):
+        """Append DecisionGenerated + ApplicationApproved/Declined/HumanReviewRequested with OCC retry."""
+        from datetime import datetime
+        from decimal import Decimal
+        from ledger.schema.events import (
+            DecisionGenerated, ApplicationApproved, ApplicationDeclined,
+            HumanReviewRequested, AgentOutputWritten
+        )
+        from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
+        from ledger.event_store import OptimisticConcurrencyError
+        
+        app_id = state["application_id"]
+        decision = state.get("orchestrator_decision", {})
+        
+        # Rehydrate aggregate to get current version (for OCC)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Load current aggregate state
+                agg = await LoanApplicationAggregate.load(self.store, app_id)
+                current_version = agg.version
+                
+                # Build DecisionGenerated event
+                decision_event = DecisionGenerated(
+                    application_id=app_id,
+                    orchestrator_session_id=state["session_id"],
+                    recommendation=decision.get("recommendation", "REFER"),
+                    confidence=decision.get("confidence", 0.5),
+                    approved_amount_usd=Decimal(str(decision.get("approved_amount_usd", 0))) if decision.get("approved_amount_usd") else None,
+                    conditions=decision.get("conditions", []),
+                    executive_summary=decision.get("executive_summary", ""),
+                    key_risks=decision.get("key_risks", []),
+                    contributing_sessions=[state["session_id"]],
+                    model_versions={"orchestrator": self.model},
+                    generated_at=datetime.utcnow()
+                )
+                
+                # Prepare events to append
+                events_to_append = [decision_event.to_store_dict()]
+                
+                # Add outcome event based on recommendation
+                recommendation = decision.get("recommendation", "REFER")
+                if recommendation == "APPROVE":
+                    approve_event = ApplicationApproved(
+                        application_id=app_id,
+                        approved_amount_usd=Decimal(str(decision.get("approved_amount_usd", 0))),
+                        interest_rate_pct=5.5,
+                        term_months=36,
+                        conditions=decision.get("conditions", []),
+                        approved_by=f"agent-{self.agent_id}",
+                        effective_date=datetime.utcnow().date().isoformat(),
+                        approved_at=datetime.utcnow()
+                    )
+                    events_to_append.append(approve_event.to_store_dict())
+                    state["output_events_written"] = ["DecisionGenerated", "ApplicationApproved"]
+                
+                elif recommendation == "DECLINE":
+                    decline_event = ApplicationDeclined(
+                        application_id=app_id,
+                        decline_reasons=decision.get("key_risks", ["Risk assessment failed"]),
+                        declined_by=f"agent-{self.agent_id}",
+                        adverse_action_notice_required=True,
+                        adverse_action_codes=["CREDIT_RISK", "POLICY_VIOLATION"],
+                        declined_at=datetime.utcnow()
+                    )
+                    events_to_append.append(decline_event.to_store_dict())
+                    state["output_events_written"] = ["DecisionGenerated", "ApplicationDeclined"]
+                
+                else:  # REFER
+                    review_event = HumanReviewRequested(
+                        application_id=app_id,
+                        reason="Orchestrator recommendation: REFER for human review",
+                        decision_event_id=str(decision_event.event_id),
+                        assigned_to=None,
+                        requested_at=datetime.utcnow()
+                    )
+                    events_to_append.append(review_event.to_store_dict())
+                    state["output_events_written"] = ["DecisionGenerated", "HumanReviewRequested"]
+                
+                # Append with OCC check
+                await self.store.append(f"loan-{app_id}", events_to_append, expected_version=current_version)
+                
+                # Success - break retry loop
+                break
+                
+            except OptimisticConcurrencyError as e:
+                if attempt < max_retries - 1:
+                    # Retry: reload aggregate and try again
+                    await self._record_node_execution(
+                        node_name="write_output_retry",
+                        input_summary={"attempt": attempt + 1, "error": str(e)},
+                        output_summary={"retrying": True},
+                        llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+                    )
+                    continue
+                else:
+                    # Max retries exceeded
+                    state["errors"].append(f"OCC error after {max_retries} retries: {e}")
+                    raise
+        
+        # Append AgentOutputWritten
+        output_event = AgentOutputWritten(
+            session_id=state["session_id"],
+            agent_type="decision_orchestrator",
+            application_id=app_id,
+            events_written=[{"type": e} for e in state["output_events_written"]],
+            output_summary=f"Decision: {recommendation}, Confidence: {decision.get('confidence', 0.0)}",
+            written_at=datetime.utcnow()
+        )
+        await self._append_event(output_event)
+        
+        await self._record_node_execution(
+            node_name="write_output",
+            input_summary={"recommendation": recommendation},
+            output_summary={"events_written": len(state["output_events_written"])},
+            llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0
+        )
+        return state
