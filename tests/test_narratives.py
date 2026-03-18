@@ -13,15 +13,108 @@ from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent.parent))
 # Each test drives a complete application through the real agent pipeline.
 
 @pytest.mark.asyncio
-async def test_narr01_concurrent_occ_collision():
+async def test_narr01_occ_collision():
     """
     NARR-01: Two CreditAnalysisAgent instances run simultaneously.
     Expected: exactly one CreditAnalysisCompleted in credit stream (not two),
               second agent gets OCC, reloads, retries successfully.
     """
-    # This test requires CreditAnalysisAgent which is not yet implemented
-    # Skipping for now - will implement when CreditAnalysisAgent is ready
-    pytest.skip("CreditAnalysisAgent not yet implemented - Phase 4")
+    from ledger.event_store import EventStore
+    from ledger.registry.client import ApplicantRegistryClient
+    from ledger.agents.credit_analysis_agent import CreditAnalysisAgent
+    from ledger.schema.events import ApplicationSubmitted, ExtractionCompleted, FinancialFacts
+    from decimal import Decimal
+    from dotenv import load_dotenv
+    import asyncpg
+    import asyncio
+    from uuid import uuid4
+    from datetime import datetime
+    
+    load_dotenv()
+    
+    DB_URL = "postgresql://postgres:apex@localhost/apex_ledger"
+    store = EventStore(DB_URL)
+    await store.connect()
+    
+    registry_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    registry = ApplicantRegistryClient(registry_pool)
+    
+    app_id = f"NARR01-{uuid4().hex[:8]}"
+    
+    # Setup: Create loan application with documents
+    loan_events = [
+        ApplicationSubmitted(
+            application_id=app_id,
+            applicant_id="COMP-001",
+            requested_amount_usd=Decimal("500000.00"),
+            loan_purpose="working_capital",
+            loan_term_months=36,
+            submission_channel="web",
+            contact_email="narr01@test.com",
+            contact_name="NARR01 Test",
+            application_reference=f"REF-{app_id}",
+            submitted_at=datetime.utcnow()
+        )
+    ]
+    await store.append(f"loan-{app_id}", [e.to_store_dict() for e in loan_events], expected_version=-1)
+    
+    # Setup: Create document package with extraction
+    docpkg_events = [
+        ExtractionCompleted(
+            package_id=f"pkg-{app_id}",
+            document_id="DOC-NARR01-001",
+            document_type="income_statement",
+            facts=FinancialFacts(
+                total_revenue=Decimal("2000000"),
+                net_income=Decimal("200000"),
+                total_assets=Decimal("1500000"),
+                fiscal_year=2023
+            ),
+            raw_text_length=5000,
+            tables_extracted=3,
+            processing_ms=2000,
+            completed_at=datetime.utcnow()
+        )
+    ]
+    await store.append(f"docpkg-{app_id}", [e.to_store_dict() for e in docpkg_events], expected_version=-1)
+    
+    # Execute: Run two CreditAnalysisAgent instances concurrently
+    agent_1 = CreditAnalysisAgent(
+        agent_id="credit-agent-1",
+        agent_type="credit_analysis",
+        store=store,
+        registry=registry,
+        model="gemini-1.5-pro"
+    )
+    
+    agent_2 = CreditAnalysisAgent(
+        agent_id="credit-agent-2",
+        agent_type="credit_analysis",
+        store=store,
+        registry=registry,
+        model="gemini-1.5-pro"
+    )
+    
+    # Run both agents concurrently (one should get OCC error and retry)
+    results = await asyncio.gather(
+        agent_1.process_application(app_id),
+        agent_2.process_application(app_id),
+        return_exceptions=True
+    )
+    
+    # Verify: Check credit stream has exactly one CreditAnalysisCompleted
+    credit_events = await store.load_stream(f"credit-{app_id}")
+    completed_events = [e for e in credit_events if e["event_type"] == "CreditAnalysisCompleted"]
+    
+    assert len(completed_events) == 1, f"Expected exactly 1 CreditAnalysisCompleted, got {len(completed_events)}"
+    
+    # Verify: Both agents completed (one succeeded, one retried after OCC)
+    # At least one should have succeeded without exception
+    success_count = sum(1 for r in results if not isinstance(r, Exception))
+    assert success_count >= 1, "At least one agent should complete successfully"
+    
+    await store.close()
+    await registry_pool.close()
 
 @pytest.mark.asyncio
 async def test_narr02_document_extraction_failure():
@@ -31,9 +124,94 @@ async def test_narr02_document_extraction_failure():
               CreditAnalysisCompleted.confidence <= 0.75,
               CreditAnalysisCompleted.data_quality_caveats is non-empty.
     """
-    # This test requires CreditAnalysisAgent which is not yet implemented
-    # DocumentProcessingAgent is ready, but credit analysis is Phase 4
-    pytest.skip("CreditAnalysisAgent not yet implemented - Phase 4")
+    from ledger.event_store import EventStore
+    from ledger.registry.client import ApplicantRegistryClient
+    from ledger.agents.credit_analysis_agent import CreditAnalysisAgent
+    from ledger.schema.events import ApplicationSubmitted, ExtractionCompleted, FinancialFacts
+    from decimal import Decimal
+    from dotenv import load_dotenv
+    import asyncpg
+    
+    load_dotenv()
+    
+    DB_URL = "postgresql://postgres:apex@localhost/apex_ledger"
+    store = EventStore(DB_URL)
+    await store.connect()
+    
+    registry_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    registry = ApplicantRegistryClient(registry_pool)
+    
+    app_id = f"NARR02-{uuid4().hex[:8]}"
+    
+    # Setup: Create loan application
+    loan_events = [
+        ApplicationSubmitted(
+            application_id=app_id,
+            applicant_id="COMP-001",
+            requested_amount_usd=Decimal("400000.00"),
+            loan_purpose="expansion",
+            loan_term_months=48,
+            submission_channel="web",
+            contact_email="narr02@test.com",
+            contact_name="NARR02 Test",
+            application_reference=f"REF-{app_id}",
+            submitted_at=datetime.utcnow()
+        )
+    ]
+    await store.append(f"loan-{app_id}", [e.to_store_dict() for e in loan_events], expected_version=-1)
+    
+    # Setup: Create document with INCOMPLETE extraction (missing EBITDA)
+    docpkg_events = [
+        ExtractionCompleted(
+            package_id=f"pkg-{app_id}",
+            document_id="DOC-NARR02-001",
+            document_type="income_statement",
+            facts=FinancialFacts(
+                total_revenue=Decimal("1500000"),
+                net_income=Decimal("150000"),
+                total_assets=Decimal("1200000"),
+                fiscal_year=2023
+                # NOTE: Missing ebitda, total_liabilities, etc.
+            ),
+            raw_text_length=3000,
+            tables_extracted=1,
+            processing_ms=1800,
+            completed_at=datetime.utcnow()
+        )
+    ]
+    await store.append(f"docpkg-{app_id}", [e.to_store_dict() for e in docpkg_events], expected_version=-1)
+    
+    # Execute: Run CreditAnalysisAgent
+    agent = CreditAnalysisAgent(
+        agent_id="credit-agent-narr02",
+        agent_type="credit_analysis",
+        store=store,
+        registry=registry,
+        model="gemini-1.5-pro"
+    )
+    
+    await agent.process_application(app_id)
+    
+    # Verify: Check credit stream for CreditAnalysisCompleted
+    credit_events = await store.load_stream(f"credit-{app_id}")
+    completed_events = [e for e in credit_events if e["event_type"] == "CreditAnalysisCompleted"]
+    
+    assert len(completed_events) == 1, "Should have CreditAnalysisCompleted event"
+    
+    completed = completed_events[0]
+    payload = completed["payload"]
+    decision = payload.get("decision", {})
+    
+    # Verify: Confidence should be reduced due to missing data
+    confidence = decision.get("confidence", 1.0)
+    assert confidence <= 0.75, f"Expected confidence <= 0.75 due to missing data, got {confidence}"
+    
+    # Verify: data_quality_caveats should be non-empty
+    caveats = decision.get("data_quality_caveats", [])
+    assert len(caveats) > 0, "Expected data_quality_caveats to be non-empty due to incomplete extraction"
+    
+    await store.close()
+    await registry_pool.close()
 
 @pytest.mark.asyncio
 async def test_narr03_agent_crash_recovery():
