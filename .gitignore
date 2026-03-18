@@ -1,0 +1,13 @@
+# Local environments
+.venv/
+.venv10/
+.env
+
+#docs
+project_docs/
+
+#caches
+tests/__pycache__/
+tests/phase1/__pycache__/
+tests/phase2/__pycache__/
+tests/phase3/__pycache__/
