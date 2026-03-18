@@ -45,7 +45,7 @@ class BaseApexAgent(ABC):
     The write_output node must call self._record_output_written() then self._record_node_execution().
     """
     def __init__(self, agent_id: str, agent_type: str, store, registry,
-                 model: str = "gemini-2.0-flash", api_key: str | None = None):
+                 model: str = "gemini-1.5-pro", api_key: str | None = None):
         self.agent_id = agent_id
         self.agent_type = agent_type
         self.store = store
@@ -64,38 +64,56 @@ class BaseApexAgent(ABC):
     @abstractmethod
     def build_graph(self): raise NotImplementedError
 
-    async def process_application(self, application_id: str) -> None:
+    async def run(self, application_id: str, session_id: str | None = None, context_source: str = "fresh_start") -> None:
+        """Run the agent with optional session_id and context_source for crash recovery."""
         if not self._graph: self._graph = self.build_graph()
         self.application_id = application_id
-        self.session_id = f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
+        self.session_id = session_id or f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
         self._session_stream = f"agent-{self.agent_type}-{self.session_id}"
         self._t0 = time.time(); self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
-        await self._start_session(application_id)
+        await self._start_session(application_id, context_source)
         try:
             result = await self._graph.ainvoke(self._initial_state(application_id))
             await self._complete_session(result)
         except Exception as e:
             await self._fail_session(type(e).__name__, str(e)); raise
+    
+    async def process_application(self, application_id: str) -> None:
+        """Convenience method that calls run() with default parameters."""
+        await self.run(application_id)
 
     def _initial_state(self, app_id):
         return {"application_id": app_id, "session_id": self.session_id,
                 "agent_id": self.agent_id, "errors": [], "output_events_written": [], "next_agent_triggered": None}
 
-    async def _start_session(self, app_id):
+    async def _start_session(self, app_id, context_source="fresh_start"):
         await self._append_session({"event_type":"AgentSessionStarted","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"agent_id":self.agent_id,
             "application_id":app_id,"model_version":self.model,"langgraph_graph_version":LANGGRAPH_VERSION,
-            "context_source":"fresh","context_token_count":1000,"started_at":datetime.now().isoformat()}})
+            "context_source":context_source,"context_token_count":0,"started_at":datetime.now().isoformat()}})
 
-    async def _record_node_execution(self, name, in_keys, out_keys, ms, tok_in=None, tok_out=None, cost=None):
+    async def _record_node_execution(self, node_name=None, input_summary=None, output_summary=None, 
+                                     llm_tokens_input=0, llm_tokens_output=0, llm_cost_usd=0.0,
+                                     name=None, in_keys=None, out_keys=None, ms=None, tok_in=None, tok_out=None, cost=None):
+        """Record node execution - supports both old and new calling conventions."""
+        # Support new keyword-based calling convention
+        if node_name is not None:
+            name = node_name
+            in_keys = list(input_summary.keys()) if isinstance(input_summary, dict) else []
+            out_keys = list(output_summary.keys()) if isinstance(output_summary, dict) else []
+            ms = 10  # Default duration
+            tok_in = llm_tokens_input if llm_tokens_input > 0 else None
+            tok_out = llm_tokens_output if llm_tokens_output > 0 else None
+            cost = llm_cost_usd if llm_cost_usd > 0 else None
+        
         self._seq += 1
         if tok_in: self._tokens += tok_in + (tok_out or 0); self._llm_calls += 1
         if cost: self._cost += cost
         await self._append_session({"event_type":"AgentNodeExecuted","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"node_name":name,
-            "node_sequence":self._seq,"input_keys":in_keys,"output_keys":out_keys,
+            "node_sequence":self._seq,"input_keys":in_keys or [],"output_keys":out_keys or [],
             "llm_called":tok_in is not None,"llm_tokens_input":tok_in,"llm_tokens_output":tok_out,
-            "llm_cost_usd":cost,"duration_ms":ms,"executed_at":datetime.now().isoformat()}})
+            "llm_cost_usd":cost,"duration_ms":ms or 10,"executed_at":datetime.now().isoformat()}})
 
     async def _record_tool_call(self, tool, inp, out, ms):
         await self._append_session({"event_type":"AgentToolCalled","event_version":1,"payload":{
@@ -123,9 +141,23 @@ class BaseApexAgent(ABC):
             "recoverable":etype in ("llm_timeout","RateLimitError"),"failed_at":datetime.now().isoformat()}})
 
     async def _append_session(self, event: dict):
-        """TODO: replace print with actual EventStore.append() call"""
-        print(f"  [{self.agent_type[:8]}:{self.session_id}] {event['event_type']}")
+        """Append event to agent session stream."""
+        try:
+            ver = await self.store.stream_version(self._session_stream)
+            await self.store.append(stream_id=self._session_stream, events=[event], expected_version=ver)
+        except Exception as e:
+            # If stream doesn't exist yet, create it with version -1
+            if "does not exist" in str(e).lower() or ver == -1:
+                await self.store.append(stream_id=self._session_stream, events=[event], expected_version=-1)
+            else:
+                raise
 
+    async def _append_event(self, event, stream_id: str = None):
+        """Append an event object to a stream. If stream_id not provided, uses agent session stream."""
+        event_dict = event.to_store_dict() if hasattr(event, 'to_store_dict') else event
+        target_stream = stream_id or self._session_stream
+        await self._append_stream(target_stream, event_dict)
+    
     async def _append_stream(self, stream_id: str, event_dict: dict, causation_id: str = None):
         """Append to any aggregate stream with OCC retry."""
         for attempt in range(MAX_OCC_RETRIES):
@@ -816,15 +848,15 @@ class FraudDetectionAgent(BaseApexAgent):
         state["historical_financials"] = financial_history
         
         # Append HistoricalProfileConsumed to credit stream
-        fiscal_years = [fh["fiscal_year"] for fh in financial_history] if financial_history else []
+        fiscal_years = [fh.fiscal_year for fh in financial_history] if financial_history else []
         event = HistoricalProfileConsumed(
             application_id=app_id,
             session_id=state["session_id"],
             fiscal_years_loaded=fiscal_years,
-            has_prior_loans=company_profile.get("has_prior_loans", False) if company_profile else False,
+            has_prior_loans=False,  # Not tracked in current schema
             has_defaults=False,
-            revenue_trajectory=company_profile.get("revenue_trajectory", "UNKNOWN") if company_profile else "UNKNOWN",
-            data_hash=self._sha({"company": company_profile, "history": financial_history}),
+            revenue_trajectory=company_profile.trajectory if company_profile else "UNKNOWN",
+            data_hash=self._sha({"company": str(company_profile), "history": str(financial_history)}),
             consumed_at=datetime.utcnow()
         )
         await self._append_event(event, stream_id=f"credit-{app_id}")
