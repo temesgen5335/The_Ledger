@@ -6,15 +6,31 @@ CreditAnalysisAgent is the reference implementation with full LangGraph pattern.
 The other 4 agents are stubs with complete docstrings for implementation.
 """
 from __future__ import annotations
-import asyncio, hashlib, json, time
+import asyncio, hashlib, json, os, time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from uuid import uuid4
-from anthropic import AsyncAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
 LANGGRAPH_VERSION = "1.0.0"
 MAX_OCC_RETRIES = 5
+
+# Gemini pricing per 1M tokens (input, output) — update as models change
+_GEMINI_PRICING: dict[str, tuple[float, float]] = {
+    "gemini-2.0-flash":         (0.10,  0.40),
+    "gemini-2.0-flash-lite":    (0.075, 0.30),
+    "gemini-1.5-flash":         (0.075, 0.30),
+    "gemini-1.5-pro":           (3.50,  10.50),
+    "gemini-1.0-pro":           (0.50,  1.50),
+}
+
+def _gemini_cost(model: str, tok_in: int, tok_out: int) -> float:
+    """Compute USD cost for a Gemini call. Falls back to flash pricing if model unknown."""
+    key = next((k for k in _GEMINI_PRICING if model.startswith(k)), "gemini-2.0-flash")
+    p_in, p_out = _GEMINI_PRICING[key]
+    return round(tok_in / 1e6 * p_in + tok_out / 1e6 * p_out, 6)
 
 class BaseApexAgent(ABC):
     """
@@ -28,9 +44,18 @@ class BaseApexAgent(ABC):
     Each tool/registry call must call self._record_tool_call().
     The write_output node must call self._record_output_written() then self._record_node_execution().
     """
-    def __init__(self, agent_id: str, agent_type: str, store, registry, client: AsyncAnthropic, model="claude-sonnet-4-20250514"):
-        self.agent_id = agent_id; self.agent_type = agent_type
-        self.store = store; self.registry = registry; self.client = client; self.model = model
+    def __init__(self, agent_id: str, agent_type: str, store, registry,
+                 model: str = "gemini-2.0-flash", api_key: str | None = None):
+        self.agent_id = agent_id
+        self.agent_type = agent_type
+        self.store = store
+        self.registry = registry
+        self.model = model
+        self.client = ChatGoogleGenerativeAI(
+            model=model,
+            temperature=0,
+            google_api_key=api_key or os.environ.get("GOOGLE_API_KEY"),
+        )
         self.session_id = None; self.application_id = None
         self._session_stream = None; self._t0 = None
         self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
@@ -114,11 +139,18 @@ class BaseApexAgent(ABC):
                     await asyncio.sleep(0.1 * (2**attempt)); continue
                 raise
 
-    async def _call_llm(self, system, user, max_tokens=1024):
-        resp = await self.client.messages.create(model=self.model, max_tokens=max_tokens,
-            system=system, messages=[{"role":"user","content":user}])
-        t = resp.content[0].text; i = resp.usage.input_tokens; o = resp.usage.output_tokens
-        return t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6)
+    async def _call_llm(self, system: str, user: str, max_tokens: int = 1024):
+        """Call Gemini via LangChain. Returns (text, tok_in, tok_out, cost_usd)."""
+        llm = self.client.bind(max_output_tokens=max_tokens)
+        response = await llm.ainvoke(
+            [SystemMessage(content=system), HumanMessage(content=user)]
+        )
+        text = response.content
+        usage = response.usage_metadata or {}
+        tok_in  = usage.get("input_tokens", 0)
+        tok_out = usage.get("output_tokens", 0)
+        cost    = _gemini_cost(self.model, tok_in, tok_out)
+        return text, tok_in, tok_out, cost
 
     @staticmethod
     def _sha(d): return hashlib.sha256(json.dumps(str(d),sort_keys=True).encode()).hexdigest()[:16]
