@@ -5,9 +5,25 @@
 
 #docs
 project_docs/
+documents/
+
 
 #caches
+__pycache__/
 tests/__pycache__/
 tests/phase1/__pycache__/
 tests/phase2/__pycache__/
 tests/phase3/__pycache__/
+datagen/__pycache__/
+ledger/__pycache__/
+ledger/schema/__pycache__/
+ledger/adapters/__pycache__/
+ledger/agents/__pycache__/
+ledger/agents/refinery/__pycache__/
+ledger/agents/refinery/strategies/__pycache__/
+ledger/agents/refinery/models/__pycache__/
+ledger/agents/refinery/utils/__pycache__/
+ledger/agents/refinery/agents/__pycache__/
+ledger/domain/__pycache__/
+ledger/domain/aggregates/__pycache__/
+

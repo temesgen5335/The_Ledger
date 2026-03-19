@@ -6,6 +6,11 @@ langchain-core>=0.3.0,<0.4
 pydantic>=2.6.0,<3.0
 langgraph>=0.1.0,<0.3
 
+# Document refinery (Week 3 integration)
+pdfplumber>=0.11.0
+pymupdf>=1.24.0
+pyyaml>=6.0
+
 # Data generation
 faker>=24.0.0,<26.0
 reportlab>=4.2.0,<5.0
